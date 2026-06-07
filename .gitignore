@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Node (debug scripts only)
+node_modules/
+
+# Agent auth credentials and learned weights (local only)
+.agent-auth/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
