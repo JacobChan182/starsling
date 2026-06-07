@@ -10,6 +10,7 @@ Strategy: weighted hunt/target firing and ship placement. Weights are persisted
 and updated after each shot and game so the agent self-optimizes over time.
 """
 
+import argparse
 import base64
 import hashlib
 import json
@@ -54,7 +55,7 @@ FLEET = [
 
 # Persisted state file (host keypair + agent keypair + agent_id)
 CREDS_FILE = Path.home() / ".agent-auth" / "battleships_creds.json"
-WEIGHTS_FILE = Path.home() / ".agent-auth" / "battleships_weights.json"
+WEIGHTS_FILE = Path(__file__).resolve().parent / "battleships_weights.json"
 
 # Tunable strategy weights (defaults chosen from standard Battleships heuristics).
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -256,25 +257,72 @@ def get_or_create_agent() -> tuple[dict, dict, str]:
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
 
-def api(method: str, path: str, agent_kp: dict, agent_id: str, body=None) -> dict:
-    """Authenticated request with a fresh agent JWT; returns parsed JSON."""
-    token   = _sign_agent_jwt(agent_kp, agent_id, CAPABILITIES)
-    url     = f"{BASE}{path}"
-    headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
+RETRYABLE_STATUS = {429, 502, 503, 504}
+NETWORK_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 
-    resp = getattr(requests, method)(url, headers=headers, json=body)
 
-    if not resp.ok:
+def api(
+    method: str,
+    path: str,
+    agent_kp: dict,
+    agent_id: str,
+    body=None,
+    *,
+    max_retries: int = 6,
+    timeout: float = 30.0,
+) -> dict:
+    """Authenticated request with a fresh agent JWT; retries transient failures."""
+    url = f"{BASE}{path}"
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        token = _sign_agent_jwt(agent_kp, agent_id, CAPABILITIES)
+        headers = {"Authorization": f"Bearer {token}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+
         try:
-            err = resp.json()
-        except Exception:
-            err = resp.text
-        print(f"  HTTP {resp.status_code} {method.upper()} {path}: {err}")
-        resp.raise_for_status()
+            resp = getattr(requests, method)(
+                url, headers=headers, json=body, timeout=timeout,
+            )
+        except NETWORK_ERRORS as exc:
+            last_error = exc
+            if attempt + 1 < max_retries:
+                wait = min(2 ** attempt, 30)
+                print(
+                    f"  Network error on {method.upper()} {path}, "
+                    f"retrying in {wait}s ({attempt + 1}/{max_retries})...",
+                )
+                time.sleep(wait)
+                continue
+            raise
 
-    return resp.json()
+        if resp.status_code in RETRYABLE_STATUS and attempt + 1 < max_retries:
+            wait = min(2 ** attempt, 30)
+            print(
+                f"  HTTP {resp.status_code} on {method.upper()} {path}, "
+                f"retrying in {wait}s ({attempt + 1}/{max_retries})...",
+            )
+            time.sleep(wait)
+            continue
+
+        if not resp.ok:
+            try:
+                err = resp.json()
+            except Exception:
+                err = resp.text
+            print(f"  HTTP {resp.status_code} {method.upper()} {path}: {err}")
+            resp.raise_for_status()
+
+        return resp.json()
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"api({method} {path}) failed after {max_retries} retries")
 
 
 # ─── Self-optimizing weights ──────────────────────────────────────────────────
@@ -332,7 +380,8 @@ class StrategyOptimizer:
         pick = self._last_pick
         if not pick:
             return
-        reward = 1.0 if outcome == "HIT" else -0.35
+        good = str(outcome).upper() in ("HIT", "SUNK")
+        reward = 1.0 if good else -0.35
         for key, strength in pick["factors"].items():
             if strength == 0 or key not in TUNABLE_KEYS:
                 continue
@@ -439,7 +488,7 @@ def _shot_board(shots_data: list[dict]) -> tuple[set[tuple], set[tuple], dict[tu
     for s in shots_data:
         pos = (int(s["row"]), int(s["col"]))
         shot_positions.add(pos)
-        if s["outcome"] == "HIT":
+        if s["outcome"] in ("HIT", "SUNK"):
             hits[pos] = s.get("sunkShipClass")
             sunk_cls = s.get("sunkShipClass")
             if sunk_cls:
@@ -684,25 +733,41 @@ def pick_next_shot(
 
 # ─── Game loop ────────────────────────────────────────────────────────────────
 
-def play(agent_kp: dict, agent_id: str, optimizer: StrategyOptimizer) -> None:
+def play(
+    agent_kp: dict,
+    agent_id: str,
+    optimizer: StrategyOptimizer,
+    *,
+    force_new: bool = False,
+    session: int = 1,
+    total_sessions: int = 1,
+) -> dict:
     rows, cols = 10, 10
 
     def call(method, path, body=None):
         return api(method, path, agent_kp, agent_id, body)
 
+    if total_sessions > 1:
+        print(f"\n{'=' * 50}")
+        print(f"Training session {session}/{total_sessions}")
+        print("=" * 50)
+
     print(f"Strategy optimizer: {optimizer.summary()}")
 
-    # Resume an in-progress attempt or start a new one
-    try:
-        print("Checking for an existing active attempt...")
-        resp = call("get", "/attempts/current")
-        print("Resumed active attempt.")
-    except requests.HTTPError as exc:
-        if exc.response.status_code == 404:
-            print("No active attempt - starting a new one...")
-            resp = call("post", "/attempts")
-        else:
-            raise
+    if force_new:
+        print("Starting new attempt...")
+        resp = call("post", "/attempts")
+    else:
+        try:
+            print("Checking for an existing active attempt...")
+            resp = call("get", "/attempts/current")
+            print("Resumed active attempt.")
+        except requests.HTTPError as exc:
+            if exc.response.status_code == 404:
+                print("No active attempt - starting a new one...")
+                resp = call("post", "/attempts")
+            else:
+                raise
 
     while True:
         rt = resp.get("responseType")
@@ -734,22 +799,27 @@ def play(agent_kp: dict, agent_id: str, optimizer: StrategyOptimizer) -> None:
                 resp = call("post", "/attempts/current/shots", {"row": row, "col": col})
                 optimizer.record_shot()
 
-                # Print outcome from the fresh response state
                 if resp.get("responseType") == "MOVE_REQUIRED":
-                    fresh_shots = resp["state"].get("yourShots", [])
-                    if fresh_shots:
-                        last      = fresh_shots[-1]
-                        outcome   = last.get("outcome", "?")
-                        sunk_cls  = last.get("sunkShipClass")
-                        suffix    = f" (SANK {sunk_cls})" if sunk_cls else ""
-                        print(f"{outcome}{suffix}")
+                    fresh = resp["state"]
+                    fresh_shots = fresh.get("yourShots", [])
+                    sunk_count = len(fresh.get("sunkOpponentShipClasses", []))
+                    shot_rec = next(
+                        (s for s in reversed(fresh_shots)
+                         if int(s["row"]) == row and int(s["col"]) == col),
+                        fresh_shots[-1] if fresh_shots else None,
+                    )
+                    if shot_rec:
+                        outcome  = shot_rec.get("outcome", "?")
+                        sunk_cls = shot_rec.get("sunkShipClass")
+                        suffix   = f" (SANK {sunk_cls})" if sunk_cls else ""
+                        print(f"{outcome}{suffix}  [{sunk_count}/{len(FLEET)} sunk]")
                         optimizer.learn_from_shot(outcome)
                     else:
                         print()
 
             else:
                 print(f"Unknown nextRequiredMove: {next_move!r}")
-                break
+                return {"status": "error", "reason": f"unknown move {next_move!r}"}
 
         # ── GAME_COMPLETED ─────────────────────────────────────────────────
         elif rt == "GAME_COMPLETED":
@@ -775,7 +845,7 @@ def play(agent_kp: dict, agent_id: str, optimizer: StrategyOptimizer) -> None:
             print(f"Final Score: {final_score}")
             print(f"Optimizer: {optimizer.summary()}")
             print("=" * 50)
-            return
+            return {"status": "completed", "final_score": final_score}
 
         # ── ATTEMPT_DISQUALIFIED ───────────────────────────────────────────
         elif rt == "ATTEMPT_DISQUALIFIED":
@@ -785,21 +855,134 @@ def play(agent_kp: dict, agent_id: str, optimizer: StrategyOptimizer) -> None:
                 or json.dumps(resp)
             )
             print(f"\nATTEMPT DISQUALIFIED: {reason}")
-            return
+            optimizer.save()
+            return {"status": "disqualified", "reason": reason}
 
         else:
             print(f"Unexpected responseType: {rt!r}")
             print(json.dumps(resp, indent=2))
-            break
+            return {"status": "error", "reason": f"unexpected responseType {rt!r}"}
+
+
+def run_training(
+    agent_kp: dict,
+    agent_id: str,
+    optimizer: StrategyOptimizer,
+    sessions: int,
+    pause: float,
+    session_retries: int = 3,
+) -> None:
+    """Play multiple full attempts back-to-back to train strategy weights."""
+    results: list[dict] = []
+
+    for i in range(1, sessions + 1):
+        result: dict | None = None
+        for attempt in range(1, session_retries + 1):
+            try:
+                # After a network failure, resume the in-progress attempt instead of starting over.
+                force_new = i > 1 and attempt == 1
+                result = play(
+                    agent_kp,
+                    agent_id,
+                    optimizer,
+                    force_new=force_new,
+                    session=i,
+                    total_sessions=sessions,
+                )
+                break
+            except NETWORK_ERRORS as exc:
+                optimizer.save()
+                if attempt < session_retries:
+                    wait = min(2 ** attempt * 2, 60)
+                    print(
+                        f"\nSession {i} interrupted: {exc}\n"
+                        f"Retrying in {wait}s ({attempt}/{session_retries}) "
+                        f"(will resume active attempt)...",
+                    )
+                    time.sleep(wait)
+                else:
+                    result = {"status": "error", "reason": str(exc)}
+                    print(f"\nSession {i} failed after {session_retries} attempts.")
+
+        results.append(result or {"status": "error", "reason": "unknown"})
+
+        if i < sessions:
+            if pause > 0:
+                print(f"\nPausing {pause:.0f}s before next session...")
+                time.sleep(pause)
+
+    completed = [r for r in results if r.get("status") == "completed"]
+    disqualified = [r for r in results if r.get("status") == "disqualified"]
+    errors = [r for r in results if r.get("status") == "error"]
+    scores = [r["final_score"] for r in completed if r.get("final_score") is not None]
+
+    print("\n" + "=" * 50)
+    print("TRAINING SUMMARY")
+    print("=" * 50)
+    print(f"Sessions:      {sessions}")
+    print(f"Completed:     {len(completed)}")
+    print(f"Disqualified:  {len(disqualified)}")
+    print(f"Errors:        {len(errors)}")
+    if scores:
+        numeric = [float(s) for s in scores if _is_number(s)]
+        if numeric:
+            print(f"Score range:   {min(numeric):.0f} - {max(numeric):.0f}")
+            print(f"Average score: {sum(numeric) / len(numeric):.1f}")
+    print(f"Final weights: {optimizer.summary()}")
+    print(f"Saved to:      {optimizer.path}")
+    print("=" * 50)
+
+
+def _is_number(value: object) -> bool:
+    try:
+        float(value)  # type: ignore[arg-type]
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Battleships agent for the intern server")
+    parser.add_argument(
+        "--train", "-t",
+        type=int,
+        default=1,
+        metavar="N",
+        help="run N full attempts back-to-back to train strategy weights (default: 1)",
+    )
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=2.0,
+        metavar="SEC",
+        help="seconds to wait between training sessions (default: 2)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help="retries per training session after network errors (default: 3)",
+    )
+    args = parser.parse_args()
+
+    if args.train < 1:
+        parser.error("--train must be at least 1")
+    if args.retries < 1:
+        parser.error("--retries must be at least 1")
+
     host_kp, agent_kp, agent_id = get_or_create_agent()
     optimizer = StrategyOptimizer()
     print(f"\nAgent: {agent_id}\n")
-    play(agent_kp, agent_id, optimizer)
+
+    if args.train == 1:
+        play(agent_kp, agent_id, optimizer)
+    else:
+        run_training(
+            agent_kp, agent_id, optimizer, args.train, args.pause, args.retries,
+        )
 
 
 if __name__ == "__main__":

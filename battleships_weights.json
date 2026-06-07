@@ -1,0 +1,18 @@
+{
+  "hunt_parity_even": 0.0521,
+  "hunt_parity_odd": 0.05,
+  "hunt_center": 0.051,
+  "hunt_heatmap": 0.2626,
+  "target_inline": 4.9633,
+  "target_perpendicular": 4.1978,
+  "target_miss_adjacent": 0.4418,
+  "placement_horizontal": 1.0,
+  "placement_vertical": 1.0,
+  "placement_edge_penalty": 0.45,
+  "_stats": {
+    "games": 55,
+    "wins": 1,
+    "total_shots": 2712,
+    "total_score": 12.0
+  }
+}
