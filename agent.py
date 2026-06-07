@@ -376,18 +376,19 @@ class StrategyOptimizer:
         self._last_pick = {"row": row, "col": col, "factors": factors, "mode": mode}
 
     def learn_from_shot(self, outcome: str) -> None:
-        lr = self.weights["learning_rate"] * 0.35
+        """Shot-level learning only in target mode — hunt misses are expected."""
         pick = self._last_pick
-        if not pick:
+        if not pick or pick["mode"] != "target":
             return
+        lr = self.weights["learning_rate"] * 0.2
         good = str(outcome).upper() in ("HIT", "SUNK")
-        reward = 1.0 if good else -0.35
+        reward = 1.0 if good else -0.25
         for key, strength in pick["factors"].items():
             if strength == 0 or key not in TUNABLE_KEYS:
                 continue
             self.nudge(key, lr * reward * strength)
-        if pick["mode"] == "target" and outcome == "MISS":
-            self.nudge("target_miss_adjacent", lr * 0.5)
+        if outcome == "MISS":
+            self.nudge("target_miss_adjacent", lr * 0.4)
 
     def begin_game(self) -> None:
         self._game_shots = 0
@@ -404,7 +405,7 @@ class StrategyOptimizer:
             score = 0.0
         self.stats["total_score"] = self.stats.get("total_score", 0.0) + score
 
-        won = str(outcome).upper() in ("WIN", "VICTORY", "SUNK_ALL", "COMPLETED")
+        won = str(outcome).upper() in ("WIN", "VICTORY", "SUNK_ALL", "COMPLETED", "AGENT", "PLAYER")
         if won:
             self.stats["wins"] = self.stats.get("wins", 0) + 1
 
@@ -444,31 +445,35 @@ class StrategyOptimizer:
         )
 
 
+def _pick_mode(factors: dict[str, float]) -> str:
+    if "target_inline" in factors or "target_perpendicular" in factors:
+        return "target"
+    return "hunt"
+
+
 def _weighted_choice(candidates: list[tuple], optimizer: StrategyOptimizer) -> tuple:
-    """Pick (row, col, factors) from scored candidates."""
+    """Pick (row, col, factors); greedy among top-tier scorers, else weighted random."""
     if not candidates:
         raise ValueError("no candidates")
     if len(candidates) == 1:
         row, col, factors = candidates[0]
-        optimizer.record_pick(
-            row, col, factors,
-            "target" if "target_inline" in factors or "target_perpendicular" in factors else "hunt",
-        )
+        optimizer.record_pick(row, col, factors, _pick_mode(factors))
         return row, col, factors
 
     scored = [(row, col, factors, sum(factors.values())) for row, col, factors in candidates]
-    max_score = max(s for *_, s in scored)
-    min_score = min(s for *_, s in scored)
-    weights = []
-    for *_, total in scored:
-        if max_score == min_score:
-            weights.append(1.0)
-        else:
-            weights.append(max(0.01, total - min_score + 0.01))
+    scored.sort(key=lambda item: item[3], reverse=True)
+    best = scored[0][3]
+    worst = scored[-1][3]
+    margin = max(0.05, (best - worst) * 0.12)
+    top = [item for item in scored if item[3] >= best - margin]
 
-    chosen = random.choices(scored, weights=weights, k=1)[0]
-    row, col, factors, _ = chosen
-    optimizer.record_pick(row, col, factors, "target" if "target_inline" in factors or "target_perpendicular" in factors else "hunt")
+    if len(top) == 1:
+        row, col, factors, _ = top[0]
+    else:
+        weights = [max(0.01, total - (best - margin) + 0.01) for *_, total in top]
+        row, col, factors, _ = random.choices(top, weights=weights, k=1)[0]
+
+    optimizer.record_pick(row, col, factors, _pick_mode(factors))
     return row, col, factors
 
 
@@ -503,12 +508,23 @@ def _shot_board(shots_data: list[dict]) -> tuple[set[tuple], set[tuple], dict[tu
 
 # ─── Ship placement ───────────────────────────────────────────────────────────
 
+def _min_manhattan_to_occupied(cells: list[tuple], occupied: set[tuple]) -> int:
+    if not occupied:
+        return 99
+    return min(abs(r - ro) + abs(c - co) for r, c in cells for ro, co in occupied)
+
+
 def place_fleet_weighted(optimizer: StrategyOptimizer, rows: int = 10, cols: int = 10) -> list[dict]:
     """Place fleet using weighted random valid positions (fast, per-ship)."""
     w = optimizer.weights
 
     def edge_penalty(cells: list[tuple]) -> float:
         return sum(w["placement_edge_penalty"] for r, c in cells if r in (0, rows - 1) or c in (0, cols - 1))
+
+    def spread_bonus(cells: list[tuple], occupied: set[tuple]) -> float:
+        # Opponents fire back — spread ships apart when possible.
+        dist = _min_manhattan_to_occupied(cells, occupied)
+        return 0.55 * min(dist, 3) / 3.0
 
     while True:
         placements: list[dict] = []
@@ -530,7 +546,7 @@ def place_fleet_weighted(optimizer: StrategyOptimizer, rows: int = 10, cols: int
                     cells = cells_fn(sr, sc)
                     if any(c in occupied for c in cells):
                         continue
-                    score = orient_w - edge_penalty(cells)
+                    score = orient_w - edge_penalty(cells) + spread_bonus(cells, occupied)
                     options.append((score, {
                         "shipClass": ship_class,
                         "orientation": orientation,
@@ -581,6 +597,104 @@ def _cluster_axis(cluster: set[tuple]) -> str | None:
     if len(cols) == 1:
         return "VERTICAL"
     return None
+
+
+def _inline_extension_shot(
+    cluster: set[tuple],
+    axis: str,
+    shot_positions: set[tuple],
+    rows: int,
+    cols: int,
+) -> tuple[int, int] | None:
+    """Fire along a known ship axis; skip ends already shot (hit or miss)."""
+    candidates: list[tuple[int, int]] = []
+    if axis == "HORIZONTAL":
+        row = next(iter(cluster))[0]
+        cols_hit = sorted(c for _, c in cluster)
+        low, high = cols_hit[0], cols_hit[-1]
+        if low > 0:
+            left = (row, low - 1)
+            if left not in shot_positions:
+                candidates.append(left)
+        if high < cols - 1:
+            right = (row, high + 1)
+            if right not in shot_positions:
+                candidates.append(right)
+    elif axis == "VERTICAL":
+        col = next(iter(cluster))[1]
+        rows_hit = sorted(r for r, _ in cluster)
+        low, high = rows_hit[0], rows_hit[-1]
+        if low > 0:
+            up = (low - 1, col)
+            if up not in shot_positions:
+                candidates.append(up)
+        if high < rows - 1:
+            down = (high + 1, col)
+            if down not in shot_positions:
+                candidates.append(down)
+    else:
+        return None
+
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _normalize_game_outcome(raw: object) -> str:
+    """Map server gameOutcome values to WIN / LOSS / ?."""
+    if raw is None:
+        return "?"
+    upper = str(raw).upper()
+    if upper in ("AGENT_WIN", "WIN", "VICTORY", "SUNK_ALL", "COMPLETED", "AGENT", "PLAYER", "YOU"):
+        return "WIN"
+    if upper in ("AGENT_LOSS", "OPPONENT_WIN", "LOSS", "DEFEAT", "OPPONENT", "ENEMY"):
+        return "LOSS"
+    return str(raw)
+
+
+def _parse_game_result(resp: dict) -> tuple[str, float | None]:
+    """Extract outcome and score from GAME_COMPLETED."""
+    result = resp.get("result") or {}
+    # Completed-game state is usually on the prior MOVE_REQUIRED payload; GAME_COMPLETED
+    # itself carries gameOutcome at the top level (not under result).
+    state = resp.get("state") or result.get("state") or {}
+
+    raw_outcome = (
+        resp.get("gameOutcome")
+        or result.get("outcome")
+        or result.get("agentOutcome")
+        or result.get("gameOutcome")
+        or result.get("winner")
+    )
+    outcome = _normalize_game_outcome(raw_outcome)
+
+    if outcome == "?":
+        sunk_opp = state.get("sunkOpponentShipClasses") or result.get("sunkOpponentShipClasses") or []
+        your_fleet = state.get("yourFleet") or result.get("yourFleet") or []
+        sunk_you = sum(1 for ship in your_fleet if ship.get("sunk"))
+        if len(sunk_opp) >= len(FLEET):
+            outcome = "WIN"
+        elif sunk_you >= len(FLEET):
+            outcome = "LOSS"
+        elif result.get("agentWon") is True:
+            outcome = "WIN"
+        elif result.get("agentWon") is False:
+            outcome = "LOSS"
+
+    score = (
+        resp.get("gameScore")
+        or resp.get("score")
+        or resp.get("scoreDelta")
+        or result.get("score")
+        or result.get("scoreDelta")
+        or result.get("gameScore")
+    )
+    try:
+        score_f = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        score_f = None
+
+    return outcome, score_f
 
 
 def _heatmap_with_constraints(
@@ -667,6 +781,19 @@ def pick_next_shot(
             cluster = _connected_hit_cluster(all_hits, pos) & unsunk_hits
             seen.update(cluster)
             clusters.append(cluster)
+
+        # Deterministic inline pursuit when ship orientation is known.
+        for cluster in clusters:
+            axis = _cluster_axis(cluster)
+            if axis and len(cluster) >= 2:
+                inline = _inline_extension_shot(cluster, axis, shot_positions, rows, cols)
+                if inline is not None:
+                    row, col = inline
+                    factors = {"target_inline": w["target_inline"]}
+                    if inline in heatmap:
+                        factors["hunt_heatmap"] = heatmap[inline]
+                    optimizer.record_pick(row, col, factors, "target")
+                    return row, col
 
         candidates: list[tuple] = []
         for cluster in clusters:
@@ -823,11 +950,10 @@ def play(
 
         # ── GAME_COMPLETED ─────────────────────────────────────────────────
         elif rt == "GAME_COMPLETED":
-            result  = resp.get("result", {})
-            outcome = result.get("outcome", "?")
-            score   = result.get("score", "?")
-            print(f"\n  Game complete - {outcome}  (score delta: {score})")
-            optimizer.learn_from_game(outcome, score)
+            outcome, score = _parse_game_result(resp)
+            score_display = score if score is not None else "n/a"
+            print(f"\n  Game complete - {outcome}  (score delta: {score_display})")
+            optimizer.learn_from_game(outcome, score if score is not None else 0.0)
             print(f"  Updated: {optimizer.summary()}")
             next_resp = resp.get("next")
             if next_resp:
